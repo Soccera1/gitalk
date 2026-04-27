@@ -83,6 +83,7 @@ static void server_usage(FILE *f) {
             "  gitalk-server resolve-conflicts\n"
             "  gitalk-server force-theirs USER\n"
             "  gitalk-server grant-force-theirs USER\n"
+            "  gitalk-server pre-receive USER\n"
             "  gitalk-server pings\n");
 }
 
@@ -124,6 +125,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "resolve-conflicts") == 0 && argc == 2) rc = cmd_resolve_conflicts();
     else if (strcmp(argv[1], "force-theirs") == 0 && argc == 3) rc = cmd_force_theirs(argv[2]);
     else if (strcmp(argv[1], "grant-force-theirs") == 0 && argc == 3) rc = cmd_grant_force_theirs(argv[2]);
+    else if (strcmp(argv[1], "pre-receive") == 0 && argc == 3) rc = cmd_pre_receive(argv[2]);
     else if (strcmp(argv[1], "pings") == 0 && argc == 2) rc = list_pings();
     else {
         server_usage(stderr);

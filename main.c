@@ -235,6 +235,8 @@ static int default_signature(git_signature **sig, git_repository *repo) {
     return -1;
 }
 
+static int parse_meta(const char *path, MessageMeta *m);
+
 static int sign_commit_buffer(const char *commit_buf, char **signature_out) {
     gpgme_ctx_t ctx = NULL;
     gpgme_data_t plain = NULL, sig = NULL;
@@ -289,7 +291,56 @@ fail:
     return -1;
 }
 
-static int git_add_commit_paths(const char **paths, size_t path_count, const char *subject, char out_oid[128]) {
+static int message_owner_for_path(const char *message_path, char owner[128]) {
+    DIR *d = opendir("meta");
+    struct dirent *ent;
+    int found = 0;
+    owner[0] = '\0';
+    if (!d) return 0;
+    while ((ent = readdir(d))) {
+        char path[MAX_PATH];
+        MessageMeta m;
+        size_t n = strlen(ent->d_name);
+        if (n < 6 || strcmp(ent->d_name + n - 5, ".meta") != 0) continue;
+        if (snprintf(path, sizeof(path), "meta/%s", ent->d_name) >= (int)sizeof(path)) continue;
+        if (parse_meta(path, &m) == 0 && strcmp(m.message_path, message_path) == 0) {
+            snprintf(owner, 128, "%s", m.sender);
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static int commit_modifies_other_messages(const char *actor, const char **paths, size_t path_count) {
+    if (!actor || !actor[0]) return 0;
+    for (size_t i = 0; i < path_count; ++i) {
+        char owner[128];
+        if (strncmp(paths[i], "messages/", 9) != 0) continue;
+        if (!message_owner_for_path(paths[i], owner)) continue;
+        if (strcmp(owner, actor) != 0) return 1;
+    }
+    return 0;
+}
+
+static int merge_permission_path(const char *branch_ref, char path[MAX_PATH]) {
+    char safe_branch[256];
+    sanitize(branch_ref, safe_branch, sizeof(safe_branch));
+    return snprintf(path, MAX_PATH, "permissions/merge-to-master/%s.perm", safe_branch) < MAX_PATH ? 0 : -1;
+}
+
+static int write_merge_permission(const char *actor, const char *branch_ref, char path[MAX_PATH]) {
+    char body[512];
+    if (mkdir_p("permissions/merge-to-master") < 0) return -1;
+    if (merge_permission_path(branch_ref, path) < 0) return -1;
+    snprintf(body, sizeof(body),
+             "user=%s\npermission=merge-to-master\nbranch=%s\ntarget=refs/heads/master\n",
+             actor, branch_ref);
+    return write_file(path, body);
+}
+
+static int git_add_commit_paths_as(const char *actor, const char **paths, size_t path_count, const char *subject, char out_oid[128]) {
     git_repository *repo = NULL;
     git_index *index = NULL;
     git_tree *tree = NULL;
@@ -300,12 +351,32 @@ static int git_add_commit_paths(const char **paths, size_t path_count, const cha
     git_oid tree_oid, commit_oid, parent_oid;
     const git_commit *parents[1];
     char *gpgsig = NULL;
+    const char **stage_paths = NULL;
+    size_t stage_count = path_count;
+    char merge_perm_path[MAX_PATH];
+    char review_branch[256];
+    char safe_actor[128];
+    int redirect_to_review = 0;
     int rc = -1;
+
+    redirect_to_review = commit_modifies_other_messages(actor, paths, path_count);
+    if (redirect_to_review) {
+        sanitize(actor, safe_actor, sizeof(safe_actor));
+        snprintf(review_branch, sizeof(review_branch), "refs/heads/review/%s/%lld", safe_actor, (long long)time(NULL));
+        if (write_merge_permission(actor, review_branch, merge_perm_path) < 0) goto done;
+        stage_paths = calloc(path_count + 1, sizeof(*stage_paths));
+        if (!stage_paths) goto done;
+        for (size_t i = 0; i < path_count; ++i) stage_paths[i] = paths[i];
+        stage_paths[path_count] = merge_perm_path;
+        stage_count = path_count + 1;
+    } else {
+        stage_paths = paths;
+    }
 
     if (open_repo(&repo) < 0) goto done;
     if (git_repository_index(&index, repo) < 0) { print_git_error("open index"); goto done; }
-    for (size_t i = 0; i < path_count; ++i) {
-        if (git_index_add_bypath(index, paths[i]) < 0) { print_git_error("add path"); goto done; }
+    for (size_t i = 0; i < stage_count; ++i) {
+        if (git_index_add_bypath(index, stage_paths[i]) < 0) { print_git_error("add path"); goto done; }
     }
     if (git_index_write(index) < 0) { print_git_error("write index"); goto done; }
     if (git_index_write_tree(&tree_oid, index) < 0) { print_git_error("write tree"); goto done; }
@@ -328,8 +399,8 @@ static int git_add_commit_paths(const char **paths, size_t path_count, const cha
         print_git_error("create signed commit");
         goto done;
     }
-    const char *head_name = "refs/heads/master";
-    if (git_repository_head(&head, repo) == 0 && git_reference_is_branch(head))
+    const char *head_name = redirect_to_review ? review_branch : "refs/heads/master";
+    if (!redirect_to_review && git_repository_head(&head, repo) == 0 && git_reference_is_branch(head))
         head_name = git_reference_name(head);
     if (git_reference_create(&updated, repo, head_name, &commit_oid, 1, subject) < 0) {
         print_git_error("update branch");
@@ -340,9 +411,11 @@ static int git_add_commit_paths(const char **paths, size_t path_count, const cha
         goto done;
     }
     if (out_oid) git_oid_tostr(out_oid, 128, &commit_oid);
+    if (redirect_to_review) printf("redirected commit to %s; merge permission recorded in %s\n", review_branch, merge_perm_path);
     rc = 0;
 
 done:
+    if (redirect_to_review) free(stage_paths);
     free(gpgsig);
     git_buf_dispose(&commit_buf);
     git_signature_free(author);
@@ -354,6 +427,14 @@ done:
     git_index_free(index);
     git_repository_free(repo);
     return rc;
+}
+
+static int git_add_commit_paths(const char **paths, size_t path_count, const char *subject, char out_oid[128]) {
+    return git_add_commit_paths_as(NULL, paths, path_count, subject, out_oid);
+}
+
+static int git_add_commit_paths_for_actor(const char *actor, const char **paths, size_t path_count, const char *subject, char out_oid[128]) {
+    return git_add_commit_paths_as(actor, paths, path_count, subject, out_oid);
 }
 
 static int git_add_commit_one(const char *path, const char *subject) {
@@ -548,6 +629,178 @@ static int path_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+static int tree_contains_merge_permission(git_repository *repo, const git_tree *tree) {
+    git_tree_entry *entry = NULL;
+    int found = 0;
+    if (git_tree_entry_bypath(&entry, tree, "permissions/merge-to-master") < 0) return 0;
+    if (git_tree_entry_type(entry) == GIT_OBJECT_TREE) {
+        git_tree *perm_tree = NULL;
+        if (git_tree_lookup(&perm_tree, repo, git_tree_entry_id(entry)) == 0) {
+            found = git_tree_entrycount(perm_tree) > 0;
+            git_tree_free(perm_tree);
+        }
+    }
+    git_tree_entry_free(entry);
+    return found;
+}
+
+static int meta_blob_matches_message(git_blob *blob, const char *message_path, char owner[128]) {
+    const char *data = git_blob_rawcontent(blob);
+    size_t len = git_blob_rawsize(blob);
+    char sender[128] = "", blob_message_path[MAX_PATH] = "";
+    size_t pos = 0;
+
+    while (pos < len) {
+        size_t start = pos;
+        size_t line_len;
+        const char *eq;
+        while (pos < len && data[pos] != '\n' && data[pos] != '\r') pos++;
+        line_len = pos - start;
+        while (pos < len && (data[pos] == '\n' || data[pos] == '\r')) pos++;
+        eq = memchr(data + start, '=', line_len);
+        if (!eq) continue;
+        if ((size_t)(eq - (data + start)) == 6 && strncmp(data + start, "sender", 6) == 0) {
+            size_t value_len = line_len - (size_t)(eq - (data + start)) - 1;
+            if (value_len >= sizeof(sender)) value_len = sizeof(sender) - 1;
+            memcpy(sender, eq + 1, value_len);
+            sender[value_len] = '\0';
+        } else if ((size_t)(eq - (data + start)) == 12 && strncmp(data + start, "message_path", 12) == 0) {
+            size_t value_len = line_len - (size_t)(eq - (data + start)) - 1;
+            if (value_len >= sizeof(blob_message_path)) value_len = sizeof(blob_message_path) - 1;
+            memcpy(blob_message_path, eq + 1, value_len);
+            blob_message_path[value_len] = '\0';
+        }
+    }
+
+    if (sender[0] && strcmp(blob_message_path, message_path) == 0) {
+        snprintf(owner, 128, "%s", sender);
+        return 1;
+    }
+    return 0;
+}
+
+static int message_owner_for_path_in_tree(git_repository *repo, const git_tree *tree, const char *message_path, char owner[128]) {
+    git_tree_entry *entry = NULL;
+    git_tree *meta_tree = NULL;
+    int found = 0;
+
+    owner[0] = '\0';
+    if (git_tree_entry_bypath(&entry, tree, "meta") < 0) return 0;
+    if (git_tree_entry_type(entry) != GIT_OBJECT_TREE) goto done;
+    if (git_tree_lookup(&meta_tree, repo, git_tree_entry_id(entry)) < 0) goto done;
+
+    for (size_t i = 0; i < git_tree_entrycount(meta_tree); ++i) {
+        const git_tree_entry *meta_entry = git_tree_entry_byindex(meta_tree, i);
+        git_blob *blob = NULL;
+        if (git_tree_entry_type(meta_entry) != GIT_OBJECT_BLOB) continue;
+        if (git_blob_lookup(&blob, repo, git_tree_entry_id(meta_entry)) == 0) {
+            found = meta_blob_matches_message(blob, message_path, owner);
+            git_blob_free(blob);
+            if (found) break;
+        }
+    }
+
+done:
+    git_tree_free(meta_tree);
+    git_tree_entry_free(entry);
+    return found;
+}
+
+static int changed_path_is_other_message(git_repository *repo, const git_tree *tree, const char *actor, const char *path) {
+    char owner[128];
+    if (!actor || !actor[0]) return 0;
+    if (strncmp(path, "messages/", 9) != 0) return 0;
+    if (!message_owner_for_path_in_tree(repo, tree, path, owner)) return 0;
+    return strcmp(owner, actor) != 0;
+}
+
+static int commit_changes_other_messages(git_repository *repo, git_commit *commit, const char *actor) {
+    git_tree *tree = NULL, *parent_tree = NULL;
+    git_commit *parent = NULL;
+    git_diff *diff = NULL;
+    size_t deltas;
+    int dangerous = 0;
+
+    if (git_commit_tree(&tree, commit) < 0) goto done;
+    if (git_commit_parentcount(commit) > 0 &&
+        git_commit_parent(&parent, commit, 0) == 0)
+        (void)git_commit_tree(&parent_tree, parent);
+    if (git_diff_tree_to_tree(&diff, repo, parent_tree, tree, NULL) < 0) goto done;
+
+    deltas = git_diff_num_deltas(diff);
+    for (size_t i = 0; i < deltas; ++i) {
+        const git_diff_delta *delta = git_diff_get_delta(diff, i);
+        const char *path = delta->new_file.path ? delta->new_file.path : delta->old_file.path;
+        if (path && changed_path_is_other_message(repo, tree, actor, path)) {
+            dangerous = 1;
+            break;
+        }
+    }
+
+done:
+    git_diff_free(diff);
+    git_tree_free(parent_tree);
+    git_commit_free(parent);
+    git_tree_free(tree);
+    return dangerous;
+}
+
+static int master_update_has_forbidden_message_change(const char *actor, const char *old_oid_s, const char *new_oid_s) {
+    git_repository *repo = NULL;
+    git_revwalk *walk = NULL;
+    git_commit *new_commit = NULL, *commit = NULL;
+    git_tree *new_tree = NULL;
+    git_oid old_oid, new_oid, oid;
+    int has_merge_permission = 0;
+    int forbidden = 0;
+
+    if (open_repo(&repo) < 0) goto done;
+    if (git_oid_fromstr(&new_oid, new_oid_s) < 0) goto done;
+    if (git_commit_lookup(&new_commit, repo, &new_oid) < 0) goto done;
+    if (git_commit_tree(&new_tree, new_commit) == 0)
+        has_merge_permission = tree_contains_merge_permission(repo, new_tree);
+
+    if (git_revwalk_new(&walk, repo) < 0) goto done;
+    git_revwalk_sorting(walk, GIT_SORT_TOPOLOGICAL);
+    if (git_revwalk_push(walk, &new_oid) < 0) goto done;
+    if (git_oid_fromstr(&old_oid, old_oid_s) == 0 && !git_oid_is_zero(&old_oid))
+        (void)git_revwalk_hide(walk, &old_oid);
+
+    while (git_revwalk_next(&oid, walk) == 0) {
+        if (git_commit_lookup(&commit, repo, &oid) < 0) goto done;
+        if (commit_changes_other_messages(repo, commit, actor)) {
+            forbidden = !has_merge_permission;
+            git_commit_free(commit);
+            commit = NULL;
+            break;
+        }
+        git_commit_free(commit);
+        commit = NULL;
+    }
+
+done:
+    git_commit_free(commit);
+    git_tree_free(new_tree);
+    git_commit_free(new_commit);
+    git_revwalk_free(walk);
+    git_repository_free(repo);
+    return forbidden;
+}
+
+static int GITALK_UNUSED cmd_pre_receive(const char *actor) {
+    char line[MAX_LINE], old_oid[128], new_oid[128], ref[256];
+    int rejected = 0;
+    while (fgets(line, sizeof(line), stdin)) {
+        if (sscanf(line, "%127s %127s %255s", old_oid, new_oid, ref) != 3) continue;
+        if (strcmp(ref, "refs/heads/master") != 0) continue;
+        if (master_update_has_forbidden_message_change(actor, old_oid, new_oid)) {
+            fprintf(stderr, "rejecting master update: %s modifies another user's messages without merge-to-master permission\n", actor);
+            rejected = 1;
+        }
+    }
+    return rejected ? -1 : 0;
+}
+
 static int force_permission_path(const char *user, char path[MAX_PATH]) {
     char safe_user[128];
     sanitize(user, safe_user, sizeof(safe_user));
@@ -669,7 +922,7 @@ static int cmd_init(const char *user) {
         git_repository_free(repo);
     }
     if (mkdir_p("messages") < 0 || mkdir_p("meta") < 0 || mkdir_p("attestations") < 0 ||
-        mkdir_p("permissions/force-theirs") < 0) return -1;
+        mkdir_p("permissions/force-theirs") < 0 || mkdir_p("permissions/merge-to-master") < 0) return -1;
     if (!path_exists(".gitalk")) {
         if (write_file(".gitalk", "version=1\n") < 0) return -1;
         int rc = git_add_commit_one(".gitalk", "gitalk initialize repository");
@@ -694,7 +947,7 @@ static int GITALK_UNUSED cmd_send(const char *sender, const char *recipient, con
     if (write_file(meta_path, body) < 0) return -1;
     snprintf(subject, sizeof(subject), "gitalk message %s from %s", id, sender);
     const char *paths[2] = { msg_path, meta_path };
-    if (git_add_commit_paths(paths, 2, subject, commit) < 0) return -1;
+    if (git_add_commit_paths_for_actor(sender, paths, 2, subject, commit) < 0) return -1;
     snprintf(body, sizeof(body),
              "id=%s\nsender=%s\nrecipient=%s\nmessage_path=%s\nplaintext_sha256=%s\ncommit=%s\n",
              id, sender, recipient, msg_path, hash, commit);
@@ -734,6 +987,7 @@ static void usage(FILE *f) {
             "  gitalk resolve-conflicts\n"
             "  gitalk force-theirs USER\n"
             "  gitalk grant-force-theirs USER\n"
+            "  gitalk pre-receive USER\n"
             "  gitalk server-verify SERVER\n"
             "  gitalk user-verify USER\n");
 }
@@ -751,6 +1005,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "resolve-conflicts") == 0 && argc == 2) rc = cmd_resolve_conflicts();
     else if (strcmp(argv[1], "force-theirs") == 0 && argc == 3) rc = cmd_force_theirs(argv[2]);
     else if (strcmp(argv[1], "grant-force-theirs") == 0 && argc == 3) rc = cmd_grant_force_theirs(argv[2]);
+    else if (strcmp(argv[1], "pre-receive") == 0 && argc == 3) rc = cmd_pre_receive(argv[2]);
     else if (strcmp(argv[1], "server-verify") == 0 && argc == 3) rc = for_each_meta(server_one, argv[2]);
     else if (strcmp(argv[1], "user-verify") == 0 && argc == 3) rc = for_each_meta(user_one, argv[2]);
     else {

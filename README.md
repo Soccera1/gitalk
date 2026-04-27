@@ -77,6 +77,20 @@ The server accepts the first permitted `force-theirs` request by creating a
 temporary `permissions/force-theirs/priority.claim`, resolves with the incoming
 side taking priority, then deletes the claim after the conflict is resolved.
 
+The server-side receive check should be installed as a git `pre-receive` hook on
+the server repository, passing the authenticated user name:
+
+```sh
+exec /path/to/gitalk-server pre-receive "$USER"
+```
+
+It rejects pushes to `master` when an introduced commit changes a tracked
+message whose sender is someone other than the pushing user, unless the resulting
+tree carries a `permissions/merge-to-master/*.perm` grant. The local `gitalk`
+commit helper mirrors this policy for normal sends by redirecting such commits to
+a `review/USER/TIMESTAMP` branch and recording that merge permission in the same
+commit.
+
 After history/tree changes, the server checks unchanged plaintext and co-signs:
 
 ```sh
