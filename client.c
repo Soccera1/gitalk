@@ -67,6 +67,8 @@ static void client_usage(FILE *f) {
             "  gitalk-client send SENDER RECIPIENT MESSAGE\n"
             "  gitalk-client list VIEWER\n"
             "  gitalk-client verify USER\n"
+            "  gitalk-client resolve-conflicts\n"
+            "  gitalk-client force-theirs USER\n"
             "  gitalk-client ping USER HOST PORT\n"
             "  gitalk-client ping-loop USER HOST PORT [INTERVAL_MS]\n");
 }
@@ -83,6 +85,8 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "send") == 0 && argc == 5) rc = cmd_send(argv[2], argv[3], argv[4]);
     else if (strcmp(argv[1], "list") == 0 && argc == 3) rc = for_each_meta(list_one, argv[2]);
     else if (strcmp(argv[1], "verify") == 0 && argc == 3) rc = for_each_meta(user_one, argv[2]);
+    else if (strcmp(argv[1], "resolve-conflicts") == 0 && argc == 2) rc = cmd_resolve_conflicts();
+    else if (strcmp(argv[1], "force-theirs") == 0 && argc == 3) rc = cmd_force_theirs(argv[2]);
     else if (strcmp(argv[1], "ping") == 0 && argc == 5) rc = send_ping(argv[2], argv[3], argv[4]);
     else if (strcmp(argv[1], "ping-loop") == 0 && (argc == 5 || argc == 6)) {
         long ms = argc == 6 ? strtol(argv[5], NULL, 10) : 250;

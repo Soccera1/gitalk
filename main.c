@@ -11,6 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <git2.h>
 #include <gpgme.h>
 
@@ -172,6 +173,17 @@ static int mkdir_p(const char *path) {
     return 0;
 }
 
+static int mkdir_parent(const char *path) {
+    char tmp[MAX_PATH];
+    char *slash;
+    if (strlen(path) >= sizeof(tmp)) return -1;
+    strcpy(tmp, path);
+    slash = strrchr(tmp, '/');
+    if (!slash) return 0;
+    *slash = '\0';
+    return mkdir_p(tmp);
+}
+
 static void sanitize(const char *in, char *out, size_t out_len) {
     size_t j = 0;
     for (size_t i = 0; in[i] && j + 1 < out_len; ++i) {
@@ -185,6 +197,18 @@ static int write_file(const char *path, const char *body) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     if (fputs(body, f) == EOF) {
+        fclose(f);
+        return -1;
+    }
+    return fclose(f);
+}
+
+static int write_bytes_file(const char *path, const void *data, size_t len) {
+    FILE *f;
+    if (mkdir_parent(path) < 0) return -1;
+    f = fopen(path, "wb");
+    if (!f) return -1;
+    if (len > 0 && fwrite(data, 1, len, f) != len) {
         fclose(f);
         return -1;
     }
@@ -337,6 +361,167 @@ static int git_add_commit_one(const char *path, const char *subject) {
     return git_add_commit_paths(paths, 1, subject, NULL);
 }
 
+static int force_permission_path(const char *user, char path[MAX_PATH]);
+static int has_force_permission(const char *user);
+static int claim_force_priority(const char *user);
+
+static int blob_bytes(git_repository *repo, const git_index_entry *entry, const void **data, size_t *len, git_blob **blob_out) {
+    git_blob *blob = NULL;
+    if (!entry) {
+        *data = NULL;
+        *len = 0;
+        *blob_out = NULL;
+        return 0;
+    }
+    if (git_blob_lookup(&blob, repo, &entry->id) < 0) {
+        print_git_error("lookup conflict blob");
+        return -1;
+    }
+    *data = git_blob_rawcontent(blob);
+    *len = git_blob_rawsize(blob);
+    *blob_out = blob;
+    return 0;
+}
+
+static int same_bytes(const void *a, size_t a_len, const void *b, size_t b_len) {
+    return a_len == b_len && (a_len == 0 || memcmp(a, b, a_len) == 0);
+}
+
+static int resolve_conflict_choice(git_repository *repo, git_index *index, const char *path, const git_index_entry *entry) {
+    const void *data;
+    size_t len;
+    git_blob *blob = NULL;
+    int rc = -1;
+    if (!entry) {
+        unlink(path);
+        if (git_index_conflict_remove(index, path) < 0) {
+            print_git_error("remove conflict");
+            return -1;
+        }
+        if (git_index_remove_bypath(index, path) < 0) {
+            print_git_error("stage deletion");
+            return -1;
+        }
+        return 0;
+    }
+    if (blob_bytes(repo, entry, &data, &len, &blob) < 0) return -1;
+    if (write_bytes_file(path, data, len) < 0) {
+        perror("write resolved file");
+        goto done;
+    }
+    if (git_index_conflict_remove(index, path) < 0) {
+        print_git_error("remove conflict");
+        goto done;
+    }
+    if (git_index_add_bypath(index, path) < 0) {
+        print_git_error("stage resolved file");
+        goto done;
+    }
+    rc = 0;
+done:
+    git_blob_free(blob);
+    return rc;
+}
+
+static int resolve_git_conflicts(int force_theirs) {
+    git_repository *repo = NULL;
+    git_index *index = NULL;
+    git_index_conflict_iterator *it = NULL;
+    const git_index_entry *ancestor, *ours, *theirs;
+    int conflicts = 0, resolved = 0, unresolved = 0, rc = -1;
+
+    if (open_repo(&repo) < 0) goto done;
+    if (git_repository_index(&index, repo) < 0) { print_git_error("open index"); goto done; }
+    if (!git_index_has_conflicts(index)) {
+        printf("no merge conflicts\n");
+        rc = 0;
+        goto done;
+    }
+    if (git_index_conflict_iterator_new(&it, index) < 0) {
+        print_git_error("iterate conflicts");
+        goto done;
+    }
+
+    while (git_index_conflict_next(&ancestor, &ours, &theirs, it) == 0) {
+        const git_index_entry *choice = NULL;
+        int has_choice = 0;
+        char path[MAX_PATH];
+        const char *entry_path = theirs ? theirs->path : (ours ? ours->path : (ancestor ? ancestor->path : "(unknown)"));
+        const void *a_data = NULL, *o_data = NULL, *t_data = NULL;
+        size_t a_len = 0, o_len = 0, t_len = 0;
+        git_blob *a_blob = NULL, *o_blob = NULL, *t_blob = NULL;
+        conflicts++;
+        if (strlen(entry_path) >= sizeof(path)) {
+            unresolved++;
+            continue;
+        }
+        strcpy(path, entry_path);
+
+        if (blob_bytes(repo, ancestor, &a_data, &a_len, &a_blob) < 0 ||
+            blob_bytes(repo, ours, &o_data, &o_len, &o_blob) < 0 ||
+            blob_bytes(repo, theirs, &t_data, &t_len, &t_blob) < 0) {
+            unresolved++;
+            goto release_blobs;
+        }
+
+        if (force_theirs) { choice = theirs; has_choice = 1; }
+        else if (ours && theirs && same_bytes(o_data, o_len, t_data, t_len)) { choice = ours; has_choice = 1; }
+        else if (ancestor && ours && theirs && same_bytes(o_data, o_len, a_data, a_len)) { choice = theirs; has_choice = 1; }
+        else if (ancestor && ours && theirs && same_bytes(t_data, t_len, a_data, a_len)) { choice = ours; has_choice = 1; }
+        else if (ancestor && ours && !theirs && same_bytes(o_data, o_len, a_data, a_len)) { choice = NULL; has_choice = 1; }
+        else if (ancestor && !ours && theirs && same_bytes(t_data, t_len, a_data, a_len)) { choice = NULL; has_choice = 1; }
+
+        if (has_choice && resolve_conflict_choice(repo, index, path, choice) == 0) {
+            printf("resolved %s using %s\n", path, choice == theirs ? "theirs" : "ours");
+            resolved++;
+        } else {
+            fprintf(stderr, "unresolved conflict: %s\n", path);
+            unresolved++;
+        }
+
+release_blobs:
+        git_blob_free(a_blob);
+        git_blob_free(o_blob);
+        git_blob_free(t_blob);
+    }
+
+    if (git_index_write(index) < 0) {
+        print_git_error("write index");
+        goto done;
+    }
+    printf("conflicts=%d resolved=%d unresolved=%d\n", conflicts, resolved, unresolved);
+    rc = unresolved == 0 ? 0 : -1;
+
+done:
+    git_index_conflict_iterator_free(it);
+    git_index_free(index);
+    git_repository_free(repo);
+    return rc;
+}
+
+static int GITALK_UNUSED cmd_resolve_conflicts(void) {
+    return resolve_git_conflicts(0);
+}
+
+static int GITALK_UNUSED cmd_force_theirs(const char *user) {
+    if (!has_force_permission(user)) {
+        fprintf(stderr, "%s does not have force-theirs permission\n", user);
+        return -1;
+    }
+    if (claim_force_priority(user) < 0) return -1;
+    return resolve_git_conflicts(1);
+}
+
+static int GITALK_UNUSED cmd_grant_force_theirs(const char *user) {
+    char path[MAX_PATH], body[256], subject[256];
+    if (mkdir_p("permissions/force-theirs") < 0) return -1;
+    if (force_permission_path(user, path) < 0) return -1;
+    snprintf(body, sizeof(body), "user=%s\npermission=force-theirs\n", user);
+    if (write_file(path, body) < 0) return -1;
+    snprintf(subject, sizeof(subject), "gitalk grant force-theirs to %s", user);
+    return git_add_commit_one(path, subject);
+}
+
 static int parse_meta(const char *path, MessageMeta *m) {
     FILE *f = fopen(path, "rb");
     char line[MAX_LINE];
@@ -362,6 +547,39 @@ static int parse_meta(const char *path, MessageMeta *m) {
 static int path_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
+}
+
+static int force_permission_path(const char *user, char path[MAX_PATH]) {
+    char safe_user[128];
+    sanitize(user, safe_user, sizeof(safe_user));
+    return snprintf(path, MAX_PATH, "permissions/force-theirs/%s.perm", safe_user) < MAX_PATH ? 0 : -1;
+}
+
+static int has_force_permission(const char *user) {
+    char path[MAX_PATH];
+    if (force_permission_path(user, path) < 0) return 0;
+    return path_exists(path);
+}
+
+static int claim_force_priority(const char *user) {
+    char safe_user[128], body[256];
+    int fd;
+    sanitize(user, safe_user, sizeof(safe_user));
+    if (mkdir_p("permissions/force-theirs") < 0) return -1;
+    fd = open("permissions/force-theirs/priority.claim", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST) fprintf(stderr, "force priority already claimed\n");
+        else perror("claim force priority");
+        return -1;
+    }
+    snprintf(body, sizeof(body), "user=%s\nclaimed_at=%lld\n", user, (long long)time(NULL));
+    if (write(fd, body, strlen(body)) != (ssize_t)strlen(body)) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    printf("force priority claimed by %s\n", safe_user);
+    return 0;
 }
 
 static int attestation_exists(const char *commit, const char *role, const char *actor) {
@@ -447,7 +665,8 @@ static int cmd_init(const char *user) {
         }
         git_repository_free(repo);
     }
-    if (mkdir_p("messages") < 0 || mkdir_p("meta") < 0 || mkdir_p("attestations") < 0) return -1;
+    if (mkdir_p("messages") < 0 || mkdir_p("meta") < 0 || mkdir_p("attestations") < 0 ||
+        mkdir_p("permissions/force-theirs") < 0) return -1;
     if (!path_exists(".gitalk")) {
         if (write_file(".gitalk", "version=1\n") < 0) return -1;
         int rc = git_add_commit_one(".gitalk", "gitalk initialize repository");
@@ -509,6 +728,9 @@ static void usage(FILE *f) {
             "  gitalk init USER\n"
             "  gitalk send SENDER RECIPIENT MESSAGE\n"
             "  gitalk list VIEWER\n"
+            "  gitalk resolve-conflicts\n"
+            "  gitalk force-theirs USER\n"
+            "  gitalk grant-force-theirs USER\n"
             "  gitalk server-verify SERVER\n"
             "  gitalk user-verify USER\n");
 }
@@ -523,6 +745,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "init") == 0 && argc == 3) rc = cmd_init(argv[2]);
     else if (strcmp(argv[1], "send") == 0 && argc == 5) rc = cmd_send(argv[2], argv[3], argv[4]);
     else if (strcmp(argv[1], "list") == 0 && argc == 3) rc = for_each_meta(list_one, argv[2]);
+    else if (strcmp(argv[1], "resolve-conflicts") == 0 && argc == 2) rc = cmd_resolve_conflicts();
+    else if (strcmp(argv[1], "force-theirs") == 0 && argc == 3) rc = cmd_force_theirs(argv[2]);
+    else if (strcmp(argv[1], "grant-force-theirs") == 0 && argc == 3) rc = cmd_grant_force_theirs(argv[2]);
     else if (strcmp(argv[1], "server-verify") == 0 && argc == 3) rc = for_each_meta(server_one, argv[2]);
     else if (strcmp(argv[1], "user-verify") == 0 && argc == 3) rc = for_each_meta(user_one, argv[2]);
     else {

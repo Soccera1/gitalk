@@ -57,6 +57,26 @@ List messages and trust state:
 ./gitalk-client list alice
 ```
 
+Resolve git merge conflicts:
+
+```sh
+./gitalk-client resolve-conflicts
+```
+
+This tries automatic index-level resolutions first: identical sides, or the side
+that changed when the other side still matches the common ancestor. If conflicts
+remain, the server can grant a user permission to force the incoming merge side
+to take priority:
+
+```sh
+./gitalk-server grant-force-theirs alice
+./gitalk-client force-theirs alice
+```
+
+The first permitted user to run `force-theirs` creates
+`permissions/force-theirs/priority.claim`; later attempts refuse to override that
+claim.
+
 After history/tree changes, the server checks unchanged plaintext and co-signs:
 
 ```sh
