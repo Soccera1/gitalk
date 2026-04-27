@@ -70,12 +70,12 @@ to take priority:
 
 ```sh
 ./gitalk-server grant-force-theirs alice
-./gitalk-client force-theirs alice
+./gitalk-server force-theirs alice
 ```
 
-The first permitted user to run `force-theirs` creates
-`permissions/force-theirs/priority.claim`; later attempts refuse to override that
-claim.
+The server accepts the first permitted `force-theirs` request by creating a
+temporary `permissions/force-theirs/priority.claim`, resolves with the incoming
+side taking priority, then deletes the claim after the conflict is resolved.
 
 After history/tree changes, the server checks unchanged plaintext and co-signs:
 

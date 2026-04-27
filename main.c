@@ -504,12 +504,11 @@ static int GITALK_UNUSED cmd_resolve_conflicts(void) {
 }
 
 static int GITALK_UNUSED cmd_force_theirs(const char *user) {
-    if (!has_force_permission(user)) {
-        fprintf(stderr, "%s does not have force-theirs permission\n", user);
-        return -1;
-    }
+    int rc;
     if (claim_force_priority(user) < 0) return -1;
-    return resolve_git_conflicts(1);
+    rc = resolve_git_conflicts(1);
+    if (rc == 0) unlink("permissions/force-theirs/priority.claim");
+    return rc;
 }
 
 static int GITALK_UNUSED cmd_grant_force_theirs(const char *user) {
@@ -564,6 +563,10 @@ static int has_force_permission(const char *user) {
 static int claim_force_priority(const char *user) {
     char safe_user[128], body[256];
     int fd;
+    if (!has_force_permission(user)) {
+        fprintf(stderr, "%s does not have force-theirs permission\n", user);
+        return -1;
+    }
     sanitize(user, safe_user, sizeof(safe_user));
     if (mkdir_p("permissions/force-theirs") < 0) return -1;
     fd = open("permissions/force-theirs/priority.claim", O_WRONLY | O_CREAT | O_EXCL, 0644);
